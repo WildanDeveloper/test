@@ -1,138 +1,156 @@
 use std;
 
-struct Word {
-    text: string,
+struct Chunk {
+    lo: int,
+    hi: int,
+    results: *Chan[ChunkResult],
+}
+
+struct ChunkResult {
+    lo: int,
+    hi: int,
     count: int,
 }
 
-fn is_word_byte(c: u8) -> bool {
-    return (c >= 97 && c <= 122) || (c >= 48 && c <= 57);
-}
-
-fn extract_words(text: string) -> Vec[string] {
-    words := vec_new[string]();
-    start := -1;
-    i := 0;
-    while text[i] != 0 {
-        if is_word_byte(text[i]) {
-            if start == -1 {
-                start = i;
-            }
-        } else {
-            if start != -1 {
-                words.push(str_sub(text, start, i - start));
-                start = -1;
-            }
-        }
-        i += 1;
+fn count_range(c: *Chunk) {
+    lim := 1;
+    while lim * lim < c.hi {
+        lim += 1;
     }
-    if start != -1 {
-        words.push(str_sub(text, start, i - start));
+    m := lim + 1;
+    base := new(u8, m);
+    for i in 0..m {
+        base[i] = 1;
     }
-    return words;
-}
-
-fn by_count(a: Word, b: Word) -> int {
-    if a.count > b.count {
-        return -1;
-    }
-    if a.count < b.count {
-        return 1;
-    }
-    return str_cmp(a.text, b.text);
-}
-
-fn sieve(limit: int) -> int {
-    n := limit + 1;
-    flags := new(u8, n);
-    for i in 0..n {
-        flags[i] = 1;
-    }
-    flags[0] = 0;
-    flags[1] = 0;
-    i := 2;
-    while i * i <= limit {
-        if flags[i] == 1 {
-            j := i * i;
-            while j < n {
-                flags[j] = 0;
-                j += i;
+    base[0] = 0;
+    base[1] = 0;
+    p := 2;
+    while p * p <= lim {
+        if base[p] == 1 {
+            j := p * p;
+            while j <= lim {
+                base[j] = 0;
+                j += p;
             }
         }
-        i += 1;
+        p += 1;
+    }
+    size := c.hi - c.lo;
+    seg := new(u8, size);
+    for i in 0..size {
+        seg[i] = 1;
+    }
+    for p in 2..m {
+        if base[p] == 1 {
+            start := (c.lo + p - 1) / p * p;
+            if start < p * p {
+                start = p * p;
+            }
+            j := start;
+            while j < c.hi {
+                seg[j - c.lo] = 0;
+                j += p;
+            }
+        }
     }
     count := 0;
-    for i in 0..n {
-        if flags[i] == 1 {
+    for i in 0..size {
+        if seg[i] == 1 {
             count += 1;
         }
     }
-    return count;
+    sys::chan_send(c.results, ChunkResult { lo: c.lo, hi: c.hi, count: count });
+}
+
+fn run_pool(workers: int, n: int, total_out: *int) -> int {
+    results := sys::chan_new[ChunkResult]();
+    chunks := new(Chunk, workers);
+    ts := new(*Thread, workers);
+    step := (n - 2 + workers - 1) / workers;
+    lo := 2;
+    t0 := sys::mono_ms();
+    for i in 0..workers {
+        hi := lo + step;
+        if hi > n {
+            hi = n;
+        }
+        chunks[i] = Chunk { lo: lo, hi: hi, results: results };
+        ts[i] = sys::thread(count_range, &chunks[i]);
+        lo = hi;
+    }
+    total := 0;
+    for _i in 0..workers {
+        r := ChunkResult { lo: 0, hi: 0, count: 0 };
+        sys::chan_recv(results, &r);
+        std::println_str(std::format("  [{}..{}): {} primes", r.lo, r.hi, r.count));
+        total += r.count;
+    }
+    for i in 0..workers {
+        sys::join(ts[i]);
+    }
+    ms := sys::mono_ms() - t0;
+    sys::chan_free(results);
+    *total_out = total;
+    return ms;
 }
 
 fn main() -> int {
-    defer std::println_str("(selesai - semua memori dibebaskan otomatis, zero leaks)");
+    defer std::println_str("(done - all memory freed automatically, zero leaks)");
 
-    arena(1 << 20) {
-        text := "wlel is a fast simple systems language wlel compiles to c and c is fast "
-              + "the arena is the syntax zero leaks zero gc fast as c simple as python "
-              + "wlel is fast wlel is simple learn it in one afternoon fast fast c c c";
+    n := 2000000;
+    expected := 148933;
+    std::println_str("== parallel prime counter ==");
+    std::println_str(std::format("counting primes below {}", n));
+    std::println_str("");
+    total := 0;
 
-        words := extract_words(text);
-        counts := map_new[string, int]();
-        for w in words {
-            counts.set(w, counts.get_or(w, 0) + 1);
-        }
-
-        items := vec_new[Word]();
-        for k in counts.keys() {
-            items.push(Word { text: k, count: counts.get(k) });
-        }
-        std::sort(items, by_count);
-
-        std::println_str("== frekuensi kata ==");
-        std::println_str(std::format("total kata: {}, unik: {}", words.len(), items.len()));
-        std::println_str("");
-        top := items.get(0).count;
-        rank := 1;
-        for it in items {
-            w := it.count * 30 / top;
-            bar := str_sub("##############################", 0, w);
-            std::println_str(std::format("{}. {} ({}) {}", rank, it.text, it.count, bar));
-            rank += 1;
-        }
-
-        std::println_str("");
-        std::println_str("== benchmark: sieve of eratosthenes ==");
-        t0 := sys::mono_ms();
-        primes := sieve(1000000);
-        ms := sys::mono_ms() - t0;
-        std::println_str(std::format("primes < 1.000.000: {} ({} ms)", primes, ms));
+    std::println_str("[1 thread]");
+    seq_ms := run_pool(1, n, &total);
+    std::println_str(std::format("total: {} primes in {} ms", total, seq_ms));
+    if total != expected {
+        std::println_str(std::format("MISMATCH: expected {}", expected));
+        sys::exit(1);
     }
+    std::println_str("");
+
+    std::println_str("[8 threads]");
+    par_ms := run_pool(8, n, &total);
+    std::println_str(std::format("total: {} primes in {} ms", total, par_ms));
+    if total != expected {
+        std::println_str(std::format("MISMATCH: expected {}", expected));
+        sys::exit(1);
+    }
+    std::println_str("");
+
+    denom := par_ms;
+    if denom < 1 {
+        denom = 1;
+    }
+    ratio := seq_ms as float / denom as float;
+    std::println_str(std::format("speedup: {}x", ratio));
     return 0;
 }
 
-test "extract words handles punctuation" {
-    ws := extract_words("hello, world! hello 123 wlel");
-    assert_eq(ws.len(), 5);
-    assert_eq(ws.get(0), "hello");
-    assert_eq(ws.get(1), "world");
-    assert_eq(ws.get(3), "123");
-    assert_eq(ws.get(4), "wlel");
+test "worker counts primes in range" {
+    ch := sys::chan_new[ChunkResult]();
+    c := Chunk { lo: 2, hi: 100, results: ch };
+    count_range(&c);
+    r := ChunkResult { lo: 0, hi: 0, count: 0 };
+    assert(sys::chan_recv(ch, &r));
+    assert_eq(r.count, 25);
+    sys::chan_free(ch);
 }
 
-test "sieve counts primes" {
-    assert_eq(sieve(10), 4);
-    assert_eq(sieve(100), 25);
+test "pool of two sums correctly" {
+    total := 0;
+    run_pool(2, 1000, &total);
+    assert_eq(total, 168);
 }
 
-test "sort by count desc with alpha tiebreak" {
-    items := vec_new[Word]();
-    items.push(Word { text: "a", count: 1 });
-    items.push(Word { text: "b", count: 3 });
-    items.push(Word { text: "c", count: 2 });
-    std::sort(items, by_count);
-    assert_eq(items.get(0).text, "b");
-    assert_eq(items.get(0).count, 3);
-    assert_eq(items.get(2).text, "a");
+test "empty channel reports drained" {
+    ch := sys::chan_new[int]();
+    sys::chan_close(ch);
+    v := 0;
+    assert(!sys::chan_recv(ch, &v));
+    sys::chan_free(ch);
 }
